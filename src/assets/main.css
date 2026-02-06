@@ -1,0 +1,26 @@
+/* Global Vars - Dark Mode by Default */
+:root {
+  --bg-color: #000000;
+  --surface-color: #1a1a1a;
+  --primary-color: #fff;
+  --text-primary: #fff;
+  --text-secondary: #aaa;
+  --accent-color: #ffd700; /* Example accent */
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background-color: var(--bg-color);
+  color: var(--text-primary);
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#app {
+  width: 100vw;
+  height: 100dvh; /* dynamic viewport height for mobile */
+  display: flex;
+  flex-direction: column;
+}

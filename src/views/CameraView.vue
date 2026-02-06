@@ -94,11 +94,70 @@ const triggerShutter = () => {
       setTimeout(() => flash.classList.remove('active'), 100)
   }
 
-  canvas.width = video.videoWidth
-  canvas.height = video.videoHeight
-  context.drawImage(video, 0, 0, canvas.width, canvas.height)
+  let imageUrl = ''
   
-  const imageUrl = canvas.toDataURL('image/jpeg', 0.9)
+  console.log('[Auto-Crop] isStraighten:', isStraighten.value)
+  console.log('[Auto-Crop] lastDetectedCorners:', lastDetectedCorners.value)
+  console.log('[Auto-Crop] window.cv:', !!window.cv)
+  
+  // Use OpenCV for Auto-Crop if enabled and document is detected
+  if (isStraighten.value && lastDetectedCorners.value && window.cv) {
+    console.log('[Auto-Crop] Attempting perspective transform...')
+    try {
+      const cv = window.cv
+      
+      // First draw video to canvas
+      canvas.width = video.videoWidth
+      canvas.height = video.videoHeight
+      context.drawImage(video, 0, 0)
+      
+      // Now read from canvas
+      let src = cv.imread(canvas)
+      let dst = new cv.Mat()
+      
+      // 1. Sort Corners: TL, TR, BR, BL
+      const pts = lastDetectedCorners.value.sort((a, b) => a.y - b.y)
+      let tl, tr, br, bl
+      if (pts[0].x < pts[1].x) { tl = pts[0]; tr = pts[1] } else { tl = pts[1]; tr = pts[0] }
+      if (pts[2].x < pts[3].x) { bl = pts[2]; br = pts[3] } else { bl = pts[3]; br = pts[2] }
+
+      // 2. Calculate Width & Height
+      const widthA = Math.sqrt(Math.pow(br.x - bl.x, 2) + Math.pow(br.y - bl.y, 2))
+      const widthB = Math.sqrt(Math.pow(tr.x - tl.x, 2) + Math.pow(tr.y - tl.y, 2))
+      const maxWidth = Math.max(widthA, widthB)
+
+      const heightA = Math.sqrt(Math.pow(tr.x - br.x, 2) + Math.pow(tr.y - br.y, 2))
+      const heightB = Math.sqrt(Math.pow(tl.x - bl.x, 2) + Math.pow(tl.y - bl.y, 2))
+      const maxHeight = Math.max(heightA, heightB)
+
+      // 3. Transformation Mats
+      let srcCoords = cv.matFromArray(4, 1, cv.CV_32FC2, [tl.x, tl.y, tr.x, tr.y, br.x, br.y, bl.x, bl.y])
+      let dstCoords = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, maxWidth, 0, maxWidth, maxHeight, 0, maxHeight])
+      
+      let M = cv.getPerspectiveTransform(srcCoords, dstCoords)
+      cv.warpPerspective(src, dst, M, new cv.Size(maxWidth, maxHeight))
+
+      // 4. Output to Canvas
+      cv.imshow(canvas, dst)
+      imageUrl = canvas.toDataURL('image/jpeg', 0.9)
+
+      // Cleanup
+      src.delete(); dst.delete(); M.delete(); srcCoords.delete(); dstCoords.delete()
+    } catch (e) {
+      console.error('[OpenCV] Auto-crop failed:', e)
+      // Fallback to regular photo
+      canvas.width = video.videoWidth
+      canvas.height = video.videoHeight
+      context.drawImage(video, 0, 0, canvas.width, canvas.height)
+      imageUrl = canvas.toDataURL('image/jpeg', 0.9)
+    }
+  } else {
+    // Regular Fallback Photo
+    canvas.width = video.videoWidth
+    canvas.height = video.videoHeight
+    context.drawImage(video, 0, 0, canvas.width, canvas.height)
+    imageUrl = canvas.toDataURL('image/jpeg', 0.9)
+  }
   
   const newScan = {
     id: Date.now(),
@@ -140,6 +199,249 @@ onUnmounted(() => {
 
 const currentFolderName = computed(() => store.currentFolder?.name || '資料夾')
 const currentFolderCount = computed(() => store.getScansByFolder(store.currentFolderId).length)
+
+// OpenCV & Edge Detection Logic
+const overlayCanvasRef = ref(null)
+const isOpenCVReady = ref(false)
+const lastDetectedCorners = ref(null)
+let detectionLoopId = null
+let captureCanvas = null // Reusable canvas for performance
+let frameHistory = [] // For temporal smoothing
+const HISTORY_SIZE = 3 // Keep last 3 frames for stability
+
+const initOpenCV = () => {
+  console.log('[OpenCV] Initializing...')
+  if (window.cv && window.cv.Mat) {
+    console.log('[OpenCV] Already loaded, starting detection')
+    isOpenCVReady.value = true
+    startDetectionLoop()
+  } else {
+    console.log('[OpenCV] Waiting for library to load...')
+    // Wait for it to load
+    document.addEventListener('opencv-ready', () => {
+      console.log('[OpenCV] Event received: opencv-ready')
+      isOpenCVReady.value = true
+      startDetectionLoop()
+    })
+    // Also poll as backup
+    const checkCV = setInterval(() => {
+      if (window.cv && window.cv.Mat) {
+        console.log('[OpenCV] Detected via polling')
+        isOpenCVReady.value = true
+        clearInterval(checkCV)
+        startDetectionLoop()
+      }
+    }, 100)
+  }
+}
+
+const startDetectionLoop = () => {
+  if (detectionLoopId) return
+  console.log('[OpenCV] Starting detection loop')
+  detectEdges()
+}
+
+const detectEdges = () => {
+  if (!isOpenCVReady.value || !videoRef.value || !overlayCanvasRef.value || !isCameraReady.value) {
+    detectionLoopId = requestAnimationFrame(detectEdges)
+    return
+  }
+
+  const cv = window.cv
+  const video = videoRef.value
+  const overlay = overlayCanvasRef.value
+  const ctx = overlay.getContext('2d')
+  
+  // Set overlay size to match video display size
+  overlay.width = video.clientWidth
+  overlay.height = video.clientHeight
+  
+  ctx.clearRect(0, 0, overlay.width, overlay.height)
+
+  try {
+    // 1. Reuse canvas for better performance
+    if (!captureCanvas) {
+      captureCanvas = document.createElement('canvas')
+    }
+    captureCanvas.width = video.videoWidth
+    captureCanvas.height = video.videoHeight
+    let captureCtx = captureCanvas.getContext('2d')
+    captureCtx.drawImage(video, 0, 0)
+    
+    let src = cv.imread(captureCanvas)
+    
+    // Downscale for performance
+    const targetWidth = 350
+    const scale = targetWidth / src.cols
+    let lowRes = new cv.Mat()
+    let dsize = new cv.Size(targetWidth, Math.round(src.rows * scale))
+    cv.resize(src, lowRes, dsize, 0, 0, cv.INTER_LINEAR)
+
+    // 2. Convert to grayscale
+    let gray = new cv.Mat()
+    cv.cvtColor(lowRes, gray, cv.COLOR_RGBA2GRAY)
+    
+    // Bilateral filter to preserve edges while reducing noise
+    let filtered = new cv.Mat()
+    cv.bilateralFilter(gray, filtered, 9, 75, 75)
+    
+    // Edge detection with optimized parameters
+    let edges = new cv.Mat()
+    cv.Canny(filtered, edges, 40, 120)
+
+    // Morphological closing to connect broken edges
+    let kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(5, 5))
+    let closed = new cv.Mat()
+    cv.morphologyEx(edges, closed, cv.MORPH_CLOSE, kernel)
+
+    // 3. Find Contours
+    let contours = new cv.MatVector()
+    let hierarchy = new cv.Mat()
+    cv.findContours(closed, contours, hierarchy, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE)
+
+    // 4. Find the best document-like quadrilateral
+    let bestPoly = null
+    let maxScore = 0
+    const imageArea = lowRes.rows * lowRes.cols
+
+    for (let i = 0; i < contours.size(); ++i) {
+      let contour = contours.get(i)
+      let area = cv.contourArea(contour)
+      
+      // Must be at least 15% of image
+      if (area < imageArea * 0.15) continue
+      
+      let peri = cv.arcLength(contour, true)
+      let approx = new cv.Mat()
+      
+      // Try to find a quadrilateral
+      cv.approxPolyDP(contour, approx, 0.02 * peri, true)
+      
+      if (approx.rows === 4) {
+        // Calculate aspect ratio and convexity
+        let rect = cv.boundingRect(approx)
+        let aspectRatio = Math.max(rect.width, rect.height) / Math.min(rect.width, rect.height)
+        
+        // Documents typically have aspect ratio between 1:1 and 2:1
+        if (aspectRatio > 0.5 && aspectRatio < 2.5) {
+          // Check if it's convex (documents should be convex)
+          let isConvex = cv.isContourConvex(approx)
+          
+          // Calculate score based on area and aspect ratio
+          let areaRatio = area / imageArea
+          let aspectScore = 1.0 / (1.0 + Math.abs(aspectRatio - 1.414)) // Prefer A4-like ratio
+          let score = areaRatio * aspectScore * (isConvex ? 1.5 : 1.0)
+          
+          if (score > maxScore) {
+            maxScore = score
+            if (bestPoly) bestPoly.delete()
+            bestPoly = approx.clone()
+          }
+        }
+      }
+      approx.delete()
+    }
+
+    // 5. Apply temporal smoothing and draw the box
+    if (bestPoly) {
+      // Extract corners
+      const corners = []
+      for (let i = 0; i < 4; i++) {
+        corners.push({
+          x: bestPoly.data32S[i * 2] / scale,
+          y: bestPoly.data32S[i * 2 + 1] / scale
+        })
+      }
+      
+      // Add to history
+      frameHistory.push(corners)
+      if (frameHistory.length > HISTORY_SIZE) {
+        frameHistory.shift()
+      }
+      
+      // Only update if we have consistent detection
+      if (frameHistory.length >= 2) {
+        // Average the corners across frames for stability
+        const smoothedCorners = []
+        for (let i = 0; i < 4; i++) {
+          let avgX = 0, avgY = 0
+          frameHistory.forEach(frame => {
+            avgX += frame[i].x
+            avgY += frame[i].y
+          })
+          smoothedCorners.push({
+            x: avgX / frameHistory.length,
+            y: avgY / frameHistory.length
+          })
+        }
+        
+        lastDetectedCorners.value = smoothedCorners
+
+        ctx.beginPath()
+        ctx.strokeStyle = '#00FFCC'
+        ctx.fillStyle = 'rgba(0, 255, 204, 0.12)'
+        ctx.lineWidth = 3
+        ctx.lineJoin = 'round'
+        
+        const pts = []
+        for (let i = 0; i < 4; i++) {
+          pts.push({
+            x: smoothedCorners[i].x * (overlay.width / captureCanvas.width),
+            y: smoothedCorners[i].y * (overlay.height / captureCanvas.height)
+          })
+        }
+        
+        // Draw path
+        ctx.moveTo(pts[0].x, pts[0].y)
+        ctx.lineTo(pts[1].x, pts[1].y)
+        ctx.lineTo(pts[2].x, pts[2].y)
+        ctx.lineTo(pts[3].x, pts[3].y)
+        ctx.closePath()
+        
+        ctx.shadowBlur = 10
+        ctx.shadowColor = '#00FFCC'
+        ctx.stroke()
+        ctx.fill()
+        
+        // Corner markers
+        ctx.shadowBlur = 0
+        pts.forEach(pt => {
+          ctx.beginPath()
+          ctx.arc(pt.x, pt.y, 8, 0, 2 * Math.PI)
+          ctx.fillStyle = '#00FFCC'
+          ctx.fill()
+          ctx.strokeStyle = '#FFFFFF'
+          ctx.lineWidth = 2
+          ctx.stroke()
+        })
+      }
+      
+      bestPoly.delete()
+    } else {
+      // Clear history if no detection
+      frameHistory = []
+      lastDetectedCorners.value = null
+    }
+
+    // Cleanup
+    src.delete(); lowRes.delete(); gray.delete(); filtered.delete(); edges.delete()
+    kernel.delete(); closed.delete(); contours.delete(); hierarchy.delete()
+  } catch (e) {
+    console.error("[OpenCV] Detection Error:", e)
+  }
+
+  detectionLoopId = requestAnimationFrame(detectEdges)
+}
+
+onMounted(() => {
+  startCamera()
+  initOpenCV()
+})
+
+onUnmounted(() => {
+  stopCamera()
+  if (detectionLoopId) cancelAnimationFrame(detectionLoopId)
+})
 </script>
 
 <template>
@@ -149,6 +451,7 @@ const currentFolderCount = computed(() => store.getScansByFolder(store.currentFo
     <!-- Viewport -->
     <div class="viewport">
         <video ref="videoRef" class="camera-feed" playsinline autoplay muted></video>
+        <canvas ref="overlayCanvasRef" class="overlay-canvas"></canvas>
         
         <!-- Flash Animation -->
         <div class="flash-overlay"></div>
@@ -265,6 +568,16 @@ const currentFolderCount = computed(() => store.getScansByFolder(store.currentFo
   width: 100%;
   height: 100%;
   object-fit: cover;
+}
+
+.overlay-canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 5;
 }
 
 .flash-overlay {

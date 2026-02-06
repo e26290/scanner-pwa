@@ -137,16 +137,81 @@ const renderImage = () => {
             data[i] = val; data[i + 1] = val; data[i + 2] = val
           }
           else if (activeFilter.value === 'magic') {
-            const factor = 1.2
-            const intercept = 128 * (1 - factor)
-            let nr = r * factor + intercept
-            let ng = g * factor + intercept
-            let nb = b * factor + intercept
+            // Magic Color v5: Smart Saturation-Aware Levels & Red Preservation
+            // Goal: Whitens background, darkens text, but PRESERVES colorful stamps (esp. Red)
             
-            if (nr > 200) nr = 255
-            if (nr < 50) nr = 0
+            const lum = 0.299 * r + 0.587 * g + 0.114 * b
             
-            data[i] = clamp(nr); data[i + 1] = clamp(ng); data[i + 2] = clamp(nb)
+            // Calculate Saturation
+            const max = Math.max(r, g, b)
+            const min = Math.min(r, g, b)
+            const sat = max === 0 ? 0 : (max - min) / max
+            
+            // --- Adaptive Levels ---
+            // If high saturation (likely a stamp), use gentle levels.
+            // If low saturation (text/paper), use aggressive levels.
+            
+            // Thresholds
+            const hiSatThreshold = 0.2 // Considered "colorful" -> Stamp
+            const loSatThreshold = 0.05 // considered "gray" -> Text/Background
+            
+            // Mixing factor (0.0 = Gray/Text, 1.0 = Color/Stamp)
+            // Smooth step function between lo and hi
+            let mix = (sat - loSatThreshold) / (hiSatThreshold - loSatThreshold)
+            mix = Math.max(0, Math.min(1, mix))
+            
+            // Define Levels Parameters
+            // Text: Aggressive black point to darken ink, white point to clean paper
+            const textBlack = 60
+            const textWhite = 200
+            
+            // Color: Gentle black point to keep color luminance, white point to match paper
+            const colorBlack = 20
+            const colorWhite = 210
+            
+            // Interpolate levels based on saturation
+            const blackPoint = textBlack + (colorBlack - textBlack) * mix
+            const whitePoint = textWhite + (colorWhite - textWhite) * mix
+            
+            // Apply Levels
+            let newLum = (lum - blackPoint) * (255 / (whitePoint - blackPoint))
+            newLum = Math.max(0, Math.min(255, newLum))
+            
+            // Brightness preservation for colors (don't darken reds too much)
+            // For highly saturated pixels, we want the luminance to track closer to original
+            // or even boosted, rather than just the levels-adjusted version.
+            if (mix > 0.5) {
+               // Blend original luminance back in for partial preservation
+               newLum = newLum * 0.7 + lum * 0.3
+            }
+            
+            // Apply brightness multiplier
+            const brightFactor = lum < 5 ? 0 : newLum / lum
+            
+            let nr = r * brightFactor
+            let ng = g * brightFactor
+            let nb = b * brightFactor
+            
+            // --- Saturation Boost ---
+            // Boost heavy for stamps, reduce for background noise
+            let satBoost = 1.0
+            if (sat < 0.05) {
+                satBoost = 0.0 // Kill color noise in background
+            } else if (sat > 0.15) {
+                satBoost = 1.6 // Vibrant stamps
+            } else {
+                satBoost = 0.5 // Damping transition
+            }
+            
+            // Apply saturation
+            const gray = (nr + ng + nb) / 3
+            nr = gray + (nr - gray) * satBoost
+            ng = gray + (ng - gray) * satBoost
+            nb = gray + (nb - gray) * satBoost
+
+            data[i]   = Math.max(0, Math.min(255, nr))
+            data[i+1] = Math.max(0, Math.min(255, ng))
+            data[i+2] = Math.max(0, Math.min(255, nb))
           }
         }
         ctx.putImageData(imageData, 0, 0)

@@ -13,9 +13,9 @@ const stream = ref(null)
 const isCameraReady = ref(false)
 const flashMode = ref('off') 
 
-// Feature Toggles (UI Only)
-const isMagicColor = ref(false)
-const isStraighten = ref(false)
+// Feature Toggles (Defaults: Magic Color and Straighten ON)
+const isMagicColor = ref(true)
+const isStraighten = ref(true)
 const isFingerRemoval = ref(false)
 
 // Folder Dropdown Logic
@@ -103,53 +103,71 @@ const triggerShutter = () => {
   // Use OpenCV for Auto-Crop if enabled and document is detected
   if (isStraighten.value && lastDetectedCorners.value && window.cv) {
     console.log('[Auto-Crop] Attempting perspective transform...')
-    try {
-      const cv = window.cv
-      
-      // First draw video to canvas
-      canvas.width = video.videoWidth
-      canvas.height = video.videoHeight
-      context.drawImage(video, 0, 0)
-      
-      // Now read from canvas
-      let src = cv.imread(canvas)
-      let dst = new cv.Mat()
-      
-      // 1. Sort Corners: TL, TR, BR, BL
-      const pts = lastDetectedCorners.value.sort((a, b) => a.y - b.y)
-      let tl, tr, br, bl
-      if (pts[0].x < pts[1].x) { tl = pts[0]; tr = pts[1] } else { tl = pts[1]; tr = pts[0] }
-      if (pts[2].x < pts[3].x) { bl = pts[2]; br = pts[3] } else { bl = pts[3]; br = pts[2] }
-
-      // 2. Calculate Width & Height
-      const widthA = Math.sqrt(Math.pow(br.x - bl.x, 2) + Math.pow(br.y - bl.y, 2))
-      const widthB = Math.sqrt(Math.pow(tr.x - tl.x, 2) + Math.pow(tr.y - tl.y, 2))
-      const maxWidth = Math.max(widthA, widthB)
-
-      const heightA = Math.sqrt(Math.pow(tr.x - br.x, 2) + Math.pow(tr.y - br.y, 2))
-      const heightB = Math.sqrt(Math.pow(tl.x - bl.x, 2) + Math.pow(tl.y - bl.y, 2))
-      const maxHeight = Math.max(heightA, heightB)
-
-      // 3. Transformation Mats
-      let srcCoords = cv.matFromArray(4, 1, cv.CV_32FC2, [tl.x, tl.y, tr.x, tr.y, br.x, br.y, bl.x, bl.y])
-      let dstCoords = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, maxWidth, 0, maxWidth, maxHeight, 0, maxHeight])
-      
-      let M = cv.getPerspectiveTransform(srcCoords, dstCoords)
-      cv.warpPerspective(src, dst, M, new cv.Size(maxWidth, maxHeight))
-
-      // 4. Output to Canvas
-      cv.imshow(canvas, dst)
-      imageUrl = canvas.toDataURL('image/jpeg', 0.9)
-
-      // Cleanup
-      src.delete(); dst.delete(); M.delete(); srcCoords.delete(); dstCoords.delete()
-    } catch (e) {
-      console.error('[OpenCV] Auto-crop failed:', e)
+    console.log('[Auto-Crop] Detected corners:', JSON.stringify(lastDetectedCorners.value))
+    
+    // Validate corners data
+    if (!Array.isArray(lastDetectedCorners.value) || lastDetectedCorners.value.length !== 4) {
+      console.error('[Auto-Crop] Invalid corners array:', lastDetectedCorners.value)
       // Fallback to regular photo
       canvas.width = video.videoWidth
       canvas.height = video.videoHeight
       context.drawImage(video, 0, 0, canvas.width, canvas.height)
       imageUrl = canvas.toDataURL('image/jpeg', 0.9)
+    } else {
+      try {
+        const cv = window.cv
+        
+        // First draw video to canvas
+        canvas.width = video.videoWidth
+        canvas.height = video.videoHeight
+        context.drawImage(video, 0, 0)
+        
+        // Now read from canvas
+        let src = cv.imread(canvas)
+        let dst = new cv.Mat()
+        
+        // 1. Sort Corners: TL, TR, BR, BL
+        const pts = lastDetectedCorners.value.sort((a, b) => a.y - b.y)
+        let tl, tr, br, bl
+        if (pts[0].x < pts[1].x) { tl = pts[0]; tr = pts[1] } else { tl = pts[1]; tr = pts[0] }
+        if (pts[2].x < pts[3].x) { bl = pts[2]; br = pts[3] } else { bl = pts[3]; br = pts[2] }
+
+        console.log('[Auto-Crop] Sorted corners - TL:', tl, 'TR:', tr, 'BR:', br, 'BL:', bl)
+
+        // 2. Calculate Width & Height
+        const widthA = Math.sqrt(Math.pow(br.x - bl.x, 2) + Math.pow(br.y - bl.y, 2))
+        const widthB = Math.sqrt(Math.pow(tr.x - tl.x, 2) + Math.pow(tr.y - tl.y, 2))
+        const maxWidth = Math.max(widthA, widthB)
+
+        const heightA = Math.sqrt(Math.pow(tr.x - br.x, 2) + Math.pow(tr.y - br.y, 2))
+        const heightB = Math.sqrt(Math.pow(tl.x - bl.x, 2) + Math.pow(tl.y - bl.y, 2))
+        const maxHeight = Math.max(heightA, heightB)
+
+        console.log('[Auto-Crop] Output dimensions:', maxWidth, 'x', maxHeight)
+
+        // 3. Transformation Mats
+        let srcCoords = cv.matFromArray(4, 1, cv.CV_32FC2, [tl.x, tl.y, tr.x, tr.y, br.x, br.y, bl.x, bl.y])
+        let dstCoords = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, maxWidth, 0, maxWidth, maxHeight, 0, maxHeight])
+        
+        let M = cv.getPerspectiveTransform(srcCoords, dstCoords)
+        cv.warpPerspective(src, dst, M, new cv.Size(maxWidth, maxHeight))
+
+        // 4. Output to Canvas
+        cv.imshow(canvas, dst)
+        imageUrl = canvas.toDataURL('image/jpeg', 0.9)
+        
+        console.log('[Auto-Crop] SUCCESS! Image cropped and straightened.')
+
+        // Cleanup
+        src.delete(); dst.delete(); M.delete(); srcCoords.delete(); dstCoords.delete()
+      } catch (e) {
+        console.error('[OpenCV] Auto-crop failed:', e)
+        // Fallback to regular photo
+        canvas.width = video.videoWidth
+        canvas.height = video.videoHeight
+        context.drawImage(video, 0, 0, canvas.width, canvas.height)
+        imageUrl = canvas.toDataURL('image/jpeg', 0.9)
+      }
     }
   } else {
     // Regular Fallback Photo
@@ -359,7 +377,8 @@ const detectEdges = () => {
         frameHistory.shift()
       }
       
-      // Only update if we have consistent detection
+      // ALWAYS set lastDetectedCorners when we have detection (for auto-crop)
+      // Use smoothed version if available, otherwise use current corners
       if (frameHistory.length >= 2) {
         // Average the corners across frames for stability
         const smoothedCorners = []
@@ -414,6 +433,9 @@ const detectEdges = () => {
           ctx.lineWidth = 2
           ctx.stroke()
         })
+      } else {
+        // First frame: set corners immediately but don't draw yet (wait for stability)
+        lastDetectedCorners.value = corners
       }
       
       bestPoly.delete()
